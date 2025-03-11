@@ -11,13 +11,36 @@ void set_recv_timeout(int sockfd, int sec)
 
 int main(int argc, char *argv[])
 {
-    if (argc != 2)
+    // 1. Parse command-line arguments
+    char *hostsfile = NULL;
+    int state = 0;
+
+    for (int i = 1; i < argc; i++)
     {
-        fprintf(stderr, "Usage: %s <hostsfile.txt>\n", argv[0]);
+        if (strcmp(argv[i], "-h") == 0 && i + 1 < argc)
+        {
+            hostsfile = argv[++i];
+        }
+        else
+        {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            return 1;
+        }
+    }
+
+    if (!hostsfile)
+    {
+        fprintf(stderr, "Error: Missing hostsfile path. Usage: %s -h <hostsfile> [-x]\n", argv[0]);
         return 1;
     }
 
-    // 1. Get our own hostname
+    if (access(hostsfile, F_OK) != 0)
+    {
+        perror("Error: Hostsfile not found");
+        return 1;
+    }
+
+    // 2. Get our own hostname
     char myName[256];
     if (gethostname(myName, sizeof(myName)) != 0)
     {
@@ -26,45 +49,76 @@ int main(int argc, char *argv[])
     }
     myName[255] = '\0';
 
-    // 2. Read the file of peer hostnames
+    // 3. Read the file of peer hostnames
     // This entire part is written by chatGPT as I am not big fan of writing
     // file parser
-    FILE *fp = fopen(argv[1], "r");
+    FILE *fp = fopen(hostsfile, "r");
     if (!fp)
     {
-        perror(argv[1]);
+        perror(hostsfile);
         return 1;
     }
 
-    char *peers[MAX_PEERS];
+    char **peers = NULL; // Dynamic array of pointers
     int peer_count = 0;
-    memset(peers, 0, sizeof(peers));
-
     char line[256];
-    while (fgets(line, sizeof(line), fp))
-    {
+
+    while (fgets(line, sizeof(line), fp)) {
         // Strip newline
         char *nl = strchr(line, '\n');
         if (nl)
             *nl = '\0';
+
         // Skip empty lines
         if (strlen(line) == 0)
             continue;
 
-        peers[peer_count] = strdup(line); // allocate & copy
-        if (!peers[peer_count])
-        {
-            perror("strdup");
+        // Reallocate memory to grow the array
+        char **new_peers = realloc(peers, (peer_count + 1) * sizeof(char *));
+        if (!new_peers) {
+            perror("realloc");
+            free(peers); // Free already allocated memory
             fclose(fp);
             return 1;
         }
+        peers = new_peers;
+
+        // Allocate and copy the line
+        peers[peer_count] = strdup(line);
+        if (!peers[peer_count]) {
+            perror("strdup");
+            for (int i = 0; i < peer_count; i++) {
+                free(peers[i]);
+            }
+            free(peers);
+            fclose(fp);
+            return 1;
+        }
+
         peer_count++;
-        if (peer_count >= MAX_PEERS)
-            break;
     }
     fclose(fp);
 
-    // 3. Create and bind a UDP socket on port 8888
+    // Check if myName is in the list of peers
+    int found = 0;
+    for (int i = 0; i < peer_count; i++) {
+        if (strcmp(peers[i], myName) == 0) {
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found) {
+        fprintf(stderr, "Error: Hostname '%s' not found in hostsfile.\n", myName);
+        // Free allocated memory before exiting
+        for (int i = 0; i < peer_count; i++) {
+            free(peers[i]);
+        }
+        free(peers);
+        return 1;
+    }
+
+    // 4. Create and bind a UDP socket on port 8888
     // All clients will be listening on port 8888
     int sockfd = -1;
     {
@@ -104,7 +158,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    // We’ll store an "online" flag for each peer
+    // Store an "online" flag for each peer
     int *online = calloc(peer_count, sizeof(int));
     if (!online)
     {
@@ -112,12 +166,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int all_online_printed = 0; // to ensure we only print once
+    int all_online_printed = 0; // to ensure we only print READY once
 
     // Main loop: keep pinging until all peers are online
     while (1)
     {
-        // 4. Send "ping:myName" to every peer not yet marked online, except ourselves
+        // 5. Send "ping:myName" to every peer not yet marked online, except ourselves
         for (int i = 0; i < peer_count; i++)
         {
             if (online[i])
@@ -165,7 +219,7 @@ int main(int argc, char *argv[])
             }
         }
 
-        // 5. Listen for responses
+        // 6. Listen for responses
         struct sockaddr_storage sender_addr;
         socklen_t addr_len = sizeof(sender_addr);
         char buffer[300];
@@ -234,7 +288,7 @@ int main(int argc, char *argv[])
         usleep(100000); // 100 milliseconds
     }
 
-    // Never reach here unless manually stop the container
+    // Technically never reach here unless manually stop the container. Just adding for completeness and good practice
     close(sockfd);
     for (int i = 0; i < peer_count; i++)
     {

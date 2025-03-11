@@ -2,9 +2,7 @@
 
 The program runs exactly as indicated in the project description.
 
-- `docker build . -t prj1` to build the image
-- `docker-compose up` to run the default docker-compose
-- `docker run --name <hostname> --network <network> --hostname <hostname> prj1 -h <hostfile>` to run individual containers
+- `docker build . -t prj2` to build the image
 
 # Errors
 
@@ -14,3 +12,4 @@ I have added some error checkers naturally as we are working in C:
 - Error thrown if the IP from getaddrinfo is invalid
 - Error thrown if the given peer name is not in the hostsfile
 - Error thrown if the message received from another peer is invalid (not ping or pong)
+- Error thrown if TCP connections fail

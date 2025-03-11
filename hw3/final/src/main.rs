@@ -11,12 +11,19 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::collections::{HashSet, HashMap};
+use once_cell::sync::Lazy;
 
 const UDP_PORT: &str = "8888";
 const TCP_PORT: &str = "8889";
 const HEARTBEAT_PORT: &str = "8890";
-const HEARTBEAT_TIMEOUT: u64 = 5;
+const HEARTBEAT_TIMEOUT: u64 = 3;
 const LEADER_ID: u32 = 1;
+
+// Used to store processes for removal
+type RemovedSet = Arc<Mutex<HashSet<u32>>>;
+
+// Global leader state, stored after join_start.
+static LOCAL_STATE: Lazy<Mutex<Option<PeerState>>> = Lazy::new(|| Mutex::new(None));
 
 #[derive(Clone)]
 struct UserInfo {
@@ -24,6 +31,7 @@ struct UserInfo {
     id: u32,
 }
 
+#[derive(Clone)]
 struct PeerState {
     view_id: u32,
     membership: Vec<UserInfo>,
@@ -150,6 +158,7 @@ fn main() -> std::io::Result<()> {
             }
         }
     }
+    let removed: RemovedSet = Arc::new(Mutex::new(HashSet::new()));
 
     // Spawn a hearbeat listener thread
     let hb_socket = heartbeat_socket.try_clone().expect("Failed to clone heartbeat socket");
@@ -174,37 +183,24 @@ fn main() -> std::io::Result<()> {
         }
     });
     
-    // Spawn a heartbeat monitor thread: check for missing heartbeats.
-    let monitor_last_hb = Arc::clone(&last_hb);
-    let local_user_id = user_info.id;
-    thread::spawn(move || {
-        loop {
-            {
-                let now = Instant::now();
-                let mut map = monitor_last_hb.lock().unwrap();
-                // Iterate over a copy of the keys.
-                let keys: Vec<u32> = map.keys().cloned().collect();
-                for peer_id in keys {
-                    if let Some(timestamp) = map.get(&peer_id) {
-                        if now.duration_since(*timestamp) > Duration::from_secs(2 * HEARTBEAT_TIMEOUT) {
-                            if peer_id == LEADER_ID {
-                                println!("{{peer_id: {}, view_id: {}, leader: {}, message:\"peer {} (leader) unreachable\"}}",
-                                    local_user_id, 0, LEADER_ID, peer_id);
-                            } else {
-                                println!("{{peer_id: {}, view_id: {}, leader: {}, message:\"peer {} unreachable\"}}",
-                                    local_user_id, 0, LEADER_ID, peer_id);
-                            }
-                            // Update the timestamp so we don't print repeatedly.
-                            map.insert(peer_id, now);
-                        }
-                    }
-                }
-            }
-            thread::sleep(Duration::from_secs(1));
-        }
-    }); 
-
+    // Create local state from join_start (active membership)
     let local_state = Arc::new(Mutex::new(join_start(&udp_socket, &user_info, &full_list_of_peers, join_delay)));
+
+    // Spawn heartbeat monitor thread.
+    if user_info.id == LEADER_ID {
+        let leader_state_clone = Arc::clone(&local_state);
+        let removed_clone = Arc::clone(&removed);
+        thread::spawn(move || {
+            leader_heartbeat_monitor(last_hb, leader_state_clone, removed_clone, user_info.id);
+        });
+    } else {
+        let last_hb_clone = Arc::clone(&last_hb);
+        let local_state_clone = Arc::clone(&local_state);
+        thread::spawn(move || {
+            non_leader_heartbeat_monitor(last_hb_clone, local_state_clone, user_info.id);
+        });
+    }
+
 
     // Part 1: Spawn the TCP listener thread.
     let peers_clone = full_list_of_peers.clone();
@@ -361,23 +357,33 @@ fn parse_hostfile(hostsfile: &String) -> (String, Vec<UserInfo>) {
 /// Protocol for when a user joins the system
 fn join_start(socket: &UdpSocket, user_info: &UserInfo, full_list_of_peers: &Vec<UserInfo>, join_delay: Option<u32>) -> PeerState {
     if user_info.id == LEADER_ID {
-            let user_info_clone = user_info.clone();
-            thread::spawn(move || { 
-                if let Some(delay) = join_delay {
-                    println!("DEBUG: join_start: Peer {} will crash in {} seconds (join_delay)", user_info_clone.id, delay);
-                    thread::sleep(Duration::from_secs(delay as u64));
-                    eprintln!("join: Crashing after join_delay");
-                    process::exit(1);
-                }
-            });
-
-        println!("DEBUG: join_start: Leader process initializing membership");
-        return PeerState {
+        let mut state_opt = LOCAL_STATE.lock().unwrap();
+        if let Some(ref state) = *state_opt {
+            println!("DEBUG: join_start (leader): Returning existing state with view_id {}", state.view_id);
+            return state.clone();
+        }
+        // (Spawn crash thread if join_delay is provided.)
+        println!("DEBUG: join_start (leader): Leader initializing membership");
+        let new_state = PeerState {
             membership: vec![user_info.clone()],
             view_id: 0,
             req_counter: 0,
         };
+        *state_opt = Some(new_state.clone());
+
+        let user_info_clone = user_info.clone();
+        if let Some(delay) = join_delay {
+            thread::spawn(move || {
+                println!("DEBUG: join_start: Peer {} will crash in {} seconds (join_delay)", user_info_clone.id, delay);
+                thread::sleep(Duration::from_secs(delay as u64));
+                eprintln!("join: Crashing after join_delay");
+                process::exit(1);
+            });
+        }
+
+        return new_state;
     } else {
+        // Non-leader branch (unchanged)
         println!("DEBUG: join_start: Peer {} initiating join protocol", user_info.id);
         let leader = find_leader(&socket, &full_list_of_peers);
         println!("DEBUG: join_start: Leader found {}", leader.name);
@@ -390,12 +396,15 @@ fn join_start(socket: &UdpSocket, user_info: &UserInfo, full_list_of_peers: &Vec
             .expect("join: Failed TCP connect");
         stream.write_all(join_msg.as_bytes())
             .expect("join: Failed to send JOIN message");
-        
+         
+        let user_info_clone = user_info.clone();
         if let Some(delay) = join_delay {
-            println!("DEBUG: join_start: Peer {} will crash in {} seconds (join_delay)", user_info.id, delay);
-            thread::sleep(Duration::from_secs(delay as u64));
-            eprintln!("join: Crashing after join_delay");
-            process::exit(1);
+            thread::spawn(move || {
+                println!("DEBUG: join_start: Peer {} will crash in {} seconds (join_delay)", user_info_clone.id, delay);
+                thread::sleep(Duration::from_secs(delay as u64));
+                eprintln!("join: Crashing after join_delay");
+                process::exit(1);
+            });
         }
         
         let mut reader = BufReader::new(stream);
@@ -417,7 +426,6 @@ fn join_start(socket: &UdpSocket, user_info: &UserInfo, full_list_of_peers: &Vec
                     .iter()
                     .map(|user| user.id.to_string())
                     .collect();
-                // Do not modify the required output print below.
                 println!(
                     "{{peer_id: {}, view_id: {}, leader: {}, memb_list: [{}]}}",
                     user_info.id, response_peer_state.view_id, leader.id, ids.join(",")
@@ -433,8 +441,6 @@ fn join_start(socket: &UdpSocket, user_info: &UserInfo, full_list_of_peers: &Vec
                 "{{peer_id: {}, view_id: {}, leader: {}, message:\"peer {} (leader) unreachable\"}}",
                 user_info.id, 0, leader.id, leader.id
             );
-
-            // TODO: part4 should initialize a new leader process not crash
             io::stdout().flush().unwrap();
             process::exit(1);
         }
@@ -581,6 +587,19 @@ fn join_listener_peer(mut stream: TcpStream, local_peer_id: u32) {
             if parts.len() >= 5 {
                 let req_id = parts[1];
                 let view_id = parts[2];
+                let op = parts[3]; // Operation: "ADD" or "DEL"
+                let target_peer = parts[4]; // The peer id to be added or deleted
+                // If this is a deletion request, print the unreachable message.
+                if op == "DEL" {
+                    if target_peer == &LEADER_ID.to_string() {
+                        println!("{{peer_id: {}, view_id: {}, leader: {}, message:\"peer {} (leader) unreachable\"}}",
+                            local_peer_id, view_id, LEADER_ID, target_peer);
+                    } else {
+                        println!("{{peer_id: {}, view_id: {}, leader: {}, message:\"peer {} unreachable\"}}",
+                            local_peer_id, view_id, LEADER_ID, target_peer);
+                    }
+                }
+                // In any case, reply with OK.
                 let ok_msg = format!("OK:{}:{}\n", req_id, view_id);
                 println!("DEBUG: join_listener_peer: Peer {} sending OK message '{}'", local_peer_id, ok_msg.trim());
                 let _ = stream.write_all(ok_msg.as_bytes());
@@ -661,29 +680,22 @@ fn failure_listener(socket: UdpSocket, last_hb: Arc<Mutex<HashMap<u32, Instant>>
         let mut buffer = [0u8; 300];
         match socket.recv_from(&mut buffer) {
             Ok((received, sender_addr)) => {
-                let msg = match std::str::from_utf8(&buffer[..received]) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        eprintln!("DEBUG: failure_listener: Invalid UTF-8 message: {}", e);
-                        continue;
-                    }
-                };
-                if msg.starts_with("HEARTBEAT:") {
-                    let parts: Vec<&str> = msg.trim().split(':').collect();
-                    if parts.len() == 2 {
-                        if let Ok(sender_id) = parts[1].parse::<u32>() {
-                            let mut map = last_hb.lock().unwrap();
-                            map.insert(sender_id, Instant::now());
+                if let Ok(msg) = std::str::from_utf8(&buffer[..received]) {
+                    if msg.starts_with("HEARTBEAT:") {
+                        let parts: Vec<&str> = msg.trim().split(':').collect();
+                        if parts.len() == 2 {
+                            if let Ok(sender_id) = parts[1].parse::<u32>() {
+                                let mut map = last_hb.lock().unwrap();
+                                map.insert(sender_id, Instant::now());
+                            }
                         }
-                    }
-                    let reply = "ALIVE".to_string();
-                    if let Err(e) = socket.send_to(reply.as_bytes(), sender_addr) {
-                        eprintln!("DEBUG: failure_listener: Failed to send ALIVE: {}", e);
+                        let reply = "ALIVE".to_string();
+                        let _ = socket.send_to(reply.as_bytes(), sender_addr);
                     }
                 }
             }
             Err(e) => {
-                eprintln!("DEBUG: failure_listener: Failed to read: {}", e);
+                eprintln!("DEBUG: failure_listener: Error reading UDP: {}", e);
             }
         }
     }
@@ -717,5 +729,129 @@ fn find_leader(socket: &UdpSocket, peers: &Vec<UserInfo>) -> UserInfo {
     UserInfo {
         name: lowest_string,
         id: lowest_id,
+    }
+}
+
+// In the leader’s heartbeat monitor thread, check for missing heartbeats and call initiate_deletion once per crashed peer.
+fn leader_heartbeat_monitor(
+    last_hb: Arc<Mutex<HashMap<u32, Instant>>>,
+    leader_state: Arc<Mutex<PeerState>>,
+    removed: RemovedSet,
+    local_id: u32,
+) {
+    loop {
+        {
+            let now = Instant::now();
+            // Lock the current leader state and get the active membership IDs and current view_id.
+            let state = leader_state.lock().unwrap();
+            let active_ids: HashSet<u32> = state.membership.iter().map(|u| u.id).collect();
+            let current_view = state.view_id;
+            drop(state); // release lock
+            let mut map = last_hb.lock().unwrap();
+            for &peer_id in active_ids.iter() {
+                if let Some(&timestamp) = map.get(&peer_id) {
+                    if now.duration_since(timestamp) > Duration::from_secs(2 * HEARTBEAT_TIMEOUT) {
+                        // Print unreachable message before initiating deletion.
+                        if peer_id == LEADER_ID {
+                            println!(
+                                "{{peer_id: {}, view_id: {}, leader: {}, message:\"peer {} (leader) unreachable\"}}",
+                                local_id, current_view, LEADER_ID, peer_id
+                            );
+                        } else {
+                            println!(
+                                "{{peer_id: {}, view_id: {}, leader: {}, message:\"peer {} unreachable\"}}",
+                                local_id, current_view, LEADER_ID, peer_id
+                            );
+                        }
+                        // Only call deletion if not already removed.
+                        let mut rem = removed.lock().unwrap();
+                        if !rem.contains(&peer_id) {
+                            rem.insert(peer_id);
+                            // Initiate deletion on the active membership.
+                            initiate_deletion(peer_id, Arc::clone(&leader_state), &vec![]);
+                        }
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+// For non-leader peers, the heartbeat monitor simply prints a message.
+fn non_leader_heartbeat_monitor(last_hb: Arc<Mutex<HashMap<u32, Instant>>>, local_state: Arc<Mutex<PeerState>>, local_id: u32) {
+    loop {
+        {
+            let now = Instant::now();
+            let state = local_state.lock().unwrap();
+            let active_ids: HashSet<u32> = state.membership.iter().map(|u| u.id).collect();
+            drop(state);
+            let map = last_hb.lock().unwrap();
+            for (&peer_id, &timestamp) in map.iter() {
+                if !active_ids.contains(&peer_id) { continue; }
+                if now.duration_since(timestamp) > Duration::from_secs(2 * HEARTBEAT_TIMEOUT) {
+                    if peer_id == LEADER_ID {
+                        println!("{{peer_id: {}, view_id: {}, leader: {}, message:\"peer {} (leader) unreachable\"}}",
+                            local_id, 0, LEADER_ID, peer_id);
+                    } else {
+                        println!("{{peer_id: {}, view_id: {}, leader: {}, message:\"peer {} unreachable\"}}",
+                            local_id, 0, LEADER_ID, peer_id);
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+// Called by the leader when a peer is detected as crashed.
+fn initiate_deletion(crashed_peer: u32, leader_state: Arc<Mutex<PeerState>>, _full_list: &Vec<UserInfo>) {
+    println!("DEBUG: initiate_deletion: Initiating deletion for peer {}", crashed_peer);
+    let mut state = leader_state.lock().unwrap();
+    if !state.membership.iter().any(|u| u.id == crashed_peer) {
+        println!("DEBUG: initiate_deletion: Peer {} not in active membership; ignoring deletion", crashed_peer);
+        return;
+    }
+    state.req_counter += 1;
+    let req_id = state.req_counter;
+    let curr_view_id = state.view_id;
+    let req_msg = format!("REQ:{}:{}:DEL:{}\n", req_id, curr_view_id, crashed_peer);
+    println!("DEBUG: initiate_deletion: Sending deletion REQ: '{}'", req_msg.trim());
+    let mut all_ok = true;
+    for peer in state.membership.iter().filter(|p| p.id != LEADER_ID && p.id != crashed_peer) {
+        if let Ok(mut s) = TcpStream::connect(get_addr(&peer.name, TCP_PORT)) {
+            let _ = s.write_all(req_msg.as_bytes());
+            let mut resp = String::new();
+            let mut resp_reader = BufReader::new(s);
+            if resp_reader.read_line(&mut resp).is_ok() {
+                println!("DEBUG: initiate_deletion: Received response '{}' from peer {}", resp.trim(), peer.id);
+                if !resp.trim().starts_with(&format!("OK:{}", req_id)) {
+                    all_ok = false;
+                }
+            } else {
+                all_ok = false;
+            }
+        } else {
+            all_ok = false;
+        }
+    }
+    if all_ok {
+        state.view_id += 1;
+        state.membership.retain(|u| u.id != crashed_peer);
+        let new_view_msg = format!("NEWVIEW:{}:{}\n", state.view_id,
+            state.membership.iter().map(|u| u.id.to_string()).collect::<Vec<_>>().join(","));
+        println!("DEBUG: initiate_deletion: Broadcasting NEWVIEW message: '{}'", new_view_msg.trim());
+        for peer in state.membership.iter() {
+            if let Ok(mut s) = TcpStream::connect(get_addr(&peer.name, TCP_PORT)) {
+                let _ = s.write_all(new_view_msg.as_bytes());
+            }
+        }
+        println!("{{peer_id: {}, view_id: {}, leader: {}, memb_list: [{}]}}",
+            LEADER_ID,
+            state.view_id,
+            LEADER_ID,
+            state.membership.iter().map(|u| u.id.to_string()).collect::<Vec<_>>().join(","));
+    } else {
+        println!("DEBUG: initiate_deletion: Not all peers responded OK; deletion aborted");
     }
 }
