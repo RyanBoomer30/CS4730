@@ -8,7 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TCP_PORT: &str = "8889";
 
@@ -32,7 +32,6 @@ struct PaxosMessage {
     proposal_num: u32,
 }
 
-/// Global Paxos state shared between proposer and acceptor.
 struct PaxosState {
     promised_proposal: u32,
     accepted_proposal: Option<u32>,
@@ -40,6 +39,9 @@ struct PaxosState {
 }
 
 fn main() {
+    // Record the program start time to calculate proposal_num
+    let program_start = Instant::now();
+
     let (hostsfile, proposed_val, delay_time) = init();
     let (user, role, target_peers) = parse_hostfile(&hostsfile);
 
@@ -52,10 +54,10 @@ fn main() {
 
     match role {
         Role::Proposer => {
-            let message = match proposed_val {
-                Some(m) => m,
+            let initial_proposal = match proposed_val {
+                Some(m) => m, 
                 None => {
-                    eprintln!("Proposer is supposed to have a proposed_val; check arguments.");
+                    eprintln!("Proposer must have a proposed value; check arguments.");
                     process::exit(1);
                 }
             };
@@ -64,52 +66,14 @@ fn main() {
                 thread::sleep(Duration::from_secs(t as u64));
             }
 
-            let proposal_num = 1; // For simplicity in Part 1, we use a fixed proposal number.
-            eprintln!(
-                "Proposer {} (id {}) starting Paxos with value '{}'",
-                user.name, user.id, message
-            );
-
-            // Phase 1: Prepare
+            // Design decision: proposal_num as elapsed seconds.
+            let proposal_num = program_start.elapsed().as_secs() as u32;
+            
+            // --- Phase 1: Prepare ---
             let mut prepared_peers = Vec::new();
-            for peer in &target_peers {
-                let addr = format!("{}:{}", peer, TCP_PORT);
-                match TcpStream::connect(&addr) {
-                    Ok(mut stream) => {
-                        println!("Proposer connected to {}", addr);
-                        let prepare_msg = PaxosMessage {
-                            peer_id: user.id,
-                            action: "sent".to_string(),
-                            message_type: "prepare".to_string(),
-                            message_value: message.to_string(),
-                            proposal_num,
-                        };
-                        let msg_json = serde_json::to_string(&prepare_msg).unwrap();
-                        stream.write(msg_json.as_bytes()).unwrap();
-                        println!("Proposer sent: {}", msg_json);
+            let mut chosen_value = initial_proposal.clone();
+            let mut highest_accepted = 0; // highest proposal number among responses with an accepted value.
 
-                        let mut buffer = [0; 512];
-                        if let Ok(n) = stream.read(&mut buffer) {
-                            let reply_str = String::from_utf8_lossy(&buffer[..n]);
-                            println!("Proposer received: {}", reply_str);
-                            let reply: PaxosMessage = serde_json::from_str(&reply_str).unwrap();
-                            if reply.message_type == "prepare_ack" {
-                                // Only add to the prepared_peers list if we got a prepare_ack.
-                                prepared_peers.push(peer.clone());
-                            }
-                            // Optionally update state with reply.message_value if needed.
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to connect to {}: {}", addr, e);
-                        // Optionally retry or mark this peer as not prepared.
-                    }
-                }
-            }
-
-            let mut prepared_peers = Vec::new();
-
-            // Retry connecting to each peer until success (or a maximum number of retries).
             for peer in &target_peers {
                 let addr = format!("{}:{}", peer, TCP_PORT);
                 let mut connected = false;
@@ -117,31 +81,33 @@ fn main() {
                 while !connected && retries < 5 {
                     match TcpStream::connect(&addr) {
                         Ok(mut stream) => {
-                            println!("Proposer connected to {}", addr);
                             let prepare_msg = PaxosMessage {
                                 peer_id: user.id,
                                 action: "sent".to_string(),
                                 message_type: "prepare".to_string(),
-                                message_value: message.to_string(),
+                                message_value: initial_proposal.clone(),
                                 proposal_num,
                             };
                             let msg_json = serde_json::to_string(&prepare_msg).unwrap();
                             stream.write(msg_json.as_bytes()).unwrap();
-                            println!("Proposer sent: {}", msg_json);
+                            eprintln!("{}", msg_json);
 
                             let mut buffer = [0; 512];
                             if let Ok(n) = stream.read(&mut buffer) {
                                 let reply_str = String::from_utf8_lossy(&buffer[..n]);
-                                println!("Proposer received: {}", reply_str);
+                                eprintln!("{}", reply_str);
                                 let reply: PaxosMessage = serde_json::from_str(&reply_str).unwrap();
                                 if reply.message_type == "prepare_ack" {
                                     prepared_peers.push(peer.clone());
-                                    connected = true;
+                                    if !reply.message_value.is_empty() && reply.proposal_num > highest_accepted {
+                                        highest_accepted = reply.proposal_num;
+                                        chosen_value = reply.message_value;
+                                    }
                                 }
+                                connected = true;
                             }
                         }
                         Err(e) => {
-                            eprintln!("Failed to connect to {}: {}. Retrying...", addr, e);
                             thread::sleep(Duration::from_secs(1));
                             retries += 1;
                         }
@@ -149,35 +115,31 @@ fn main() {
                 }
                 if !connected {
                     eprintln!("Unable to connect to {} after retries.", addr);
-                    // Depending on your design, you might decide to exit here
-                    // or to continue if a quorum is acceptable.
                 }
             }
 
-            // Phase 2: Accept - only for peers that responded in the prepare phase
+            // --- Phase 2: Accept ---
             for peer in &prepared_peers {
                 let addr = format!("{}:{}", peer, TCP_PORT);
                 match TcpStream::connect(&addr) {
                     Ok(mut stream) => {
-                        // Set a read timeout of 5 seconds.
                         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                        
                         let accept_msg = PaxosMessage {
                             peer_id: user.id,
                             action: "sent".to_string(),
                             message_type: "accept".to_string(),
-                            message_value: message.to_string(),
+                            message_value: chosen_value.clone(),
                             proposal_num,
                         };
                         let msg_json = serde_json::to_string(&accept_msg).unwrap();
                         stream.write(msg_json.as_bytes()).unwrap();
-                        println!("Proposer sent: {}", msg_json);
-            
+                        eprintln!("{}", msg_json);
+
                         let mut buffer = [0; 512];
                         match stream.read(&mut buffer) {
                             Ok(n) => {
                                 let reply_str = String::from_utf8_lossy(&buffer[..n]);
-                                println!("Proposer received: {}", reply_str);
+                                eprintln!("{}", reply_str);
                                 let reply: PaxosMessage = serde_json::from_str(&reply_str).unwrap();
                                 if reply.message_type == "accept_ack" {
                                     let mut s = state.lock().unwrap();
@@ -189,7 +151,6 @@ fn main() {
                             }
                             Err(e) => {
                                 eprintln!("Timeout or error reading from {}: {}", addr, e);
-                                // Optionally: decide to retry or mark this peer as failed.
                             }
                         }
                     }
@@ -199,10 +160,9 @@ fn main() {
                 }
             }
 
-            // Print final accepted value from shared state.
             let final_state = state.lock().unwrap();
             if let Some(ref val) = final_state.accepted_value {
-                eprintln!("Final accepted value: {}", val);
+                eprintln!("State updated: accepted_value = {}", val);
             } else {
                 eprintln!("No value accepted.");
             }
@@ -211,7 +171,7 @@ fn main() {
                 peer_id: user.id,
                 action: "chose".to_string(),
                 message_type: "chose".to_string(),
-                message_value: message.to_string(),
+                message_value: chosen_value.clone(),
                 proposal_num,
             };
             eprintln!("{}", serde_json::to_string(&chosen_msg).unwrap());
@@ -222,12 +182,10 @@ fn main() {
                 eprintln!("Failed to bind to {}: {}", addr, e);
                 process::exit(1);
             });
-            eprintln!("Acceptor {} (id {}) listening on {}", user.name, user.id, addr);
 
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        eprintln!("Accepted connection from {:?}", stream.peer_addr());
                         let state_clone = Arc::clone(&state);
                         let local_id = user.id;
                         thread::spawn(move || {
@@ -241,38 +199,42 @@ fn main() {
             }
             let final_state = state.lock().unwrap();
             if let Some(ref val) = final_state.accepted_value {
-                eprintln!("Final accepted value: {}", val);
+                eprintln!("State updated: accepted_value = {}", val);
             } else {
                 eprintln!("No value accepted.");
             }
         }
         Role::Learner => {
-            eprintln!("Learner {} does nothing.", user.name);
+            // Learner does nothing
         }
     }
 }
 
 /// Initializes the application from command-line arguments.
-/// Expected flags: -h <hostsfile>, -v <proposed_value>, -t <delay_time> (optional)
-fn init() -> (String, Option<char>, Option<u32>) {
+/// Expected flags: -h <hostsfile>, -v <proposed_value>, -t <delay_time>
+fn init() -> (String, Option<String>, Option<u32>) {
     let args: Vec<String> = env::args().skip(1).collect();
-    let (hostsfile, proposed_val, delay_time) = args.chunks(2).fold((None, None, None), |(hf, pv, dt), pair| {
-        match pair {
-            [key, value] => match key.as_str() {
-                "-h" => (Some(value.clone()), pv, dt),
-                "-v" => (hf, value.chars().next(), dt),
-                "-t" => (hf, pv, value.parse().ok()),
-                other => {
-                    eprintln!("init error: Unknown flag: {}", other);
+    
+    let (hostsfile, proposed_val, delay_time) = args.chunks(2).fold(
+        (None, None, None),
+        |(hf, pv, dt), pair| {
+            match pair {
+                [key, value] => match key.as_str() {
+                    "-h" => (Some(value.clone()), pv, dt),
+                    "-v" => (hf, Some(value.clone()), dt),
+                    "-t" => (hf, pv, value.parse().ok()),
+                    other => {
+                        eprintln!("init error: Unknown flag: {}", other);
+                        process::exit(1);
+                    }
+                },
+                _ => {
+                    eprintln!("init error: Invalid arguments format");
                     process::exit(1);
                 }
-            },
-            _ => {
-                eprintln!("init error: Invalid arguments format");
-                process::exit(1);
             }
-        }
-    });
+        },
+    );
     
     let hostsfile = match hostsfile {
         Some(h) => h,
@@ -398,7 +360,7 @@ fn handle_client(mut stream: TcpStream, my_id: u32, state: Arc<Mutex<PaxosState>
     let mut buffer = [0; 512];
     let n = stream.read(&mut buffer).unwrap();
     let received_str = String::from_utf8_lossy(&buffer[..n]);
-    eprintln!("Received: {}", received_str);
+    eprintln!("{}", received_str);
 
     let msg: PaxosMessage = serde_json::from_str(&received_str).unwrap();
     let reply_type: String;
@@ -449,5 +411,5 @@ fn handle_client(mut stream: TcpStream, my_id: u32, state: Arc<Mutex<PaxosState>
 
     let reply_str = serde_json::to_string(&reply).unwrap();
     stream.write(reply_str.as_bytes()).unwrap();
-    eprintln!("Sent: {}", reply_str);
+    eprintln!("{}", reply_str);
 }

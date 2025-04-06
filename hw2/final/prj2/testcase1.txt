@@ -1,0 +1,30 @@
+peer1  | READY
+peer3  | READY
+peer4  | READY
+peer5  | READY
+peer2  | READY
+peer1  | {id: 1, state: 0, predecessor: 5, successor: 2}
+peer3  | {id: 3, state: 1, predecessor: 2, successor: 4}
+peer4  | {id: 4, state: 0, predecessor: 3, successor: 5}
+peer5  | {id: 5, state: 0, predecessor: 4, successor: 1}
+peer2  | {id: 2, state: 0, predecessor: 1, successor: 3}
+peer3  | {id: 3, sender: 3, receiver: 4, message:"token"}
+peer4  | {id: 4, sender: 3, receiver: 4, message:"token"}
+peer4  | {id: 4, state: 1}
+peer4  | {id: 4, sender: 4, receiver: 5, message:"token"}
+peer5  | {id: 5, sender: 4, receiver: 5, message:"token"}
+peer5  | {id: 5, state: 1}
+peer4 exited with code 0
+peer1  | {id: 1, sender: 5, receiver: 1, message:"token"}
+peer1  | {id: 1, state: 1}
+peer5  | {id: 5, sender: 5, receiver: 1, message:"token"}
+peer5 exited with code 0
+peer1  | {id: 1, sender: 1, receiver: 2, message:"token"}
+peer2  | {id: 2, sender: 1, receiver: 2, message:"token"}
+peer2  | {id: 2, state: 1}
+peer1 exited with code 0
+peer3  | {id: 3, sender: 2, receiver: 3, message:"token"}
+peer3  | {id: 3, state: 2}
+peer2  | {id: 2, sender: 2, receiver: 3, message:"token"}
+peer2 exited with code 0
+peer3 exited with code 0
