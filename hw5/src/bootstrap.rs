@@ -7,7 +7,6 @@ use std::net::{SocketAddr, UdpSocket};
 use std::thread;
 use std::sync::Mutex;
 
-
 const UDP_PORT: u16 = 8888;
 
 lazy_static! {
