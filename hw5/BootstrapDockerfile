@@ -2,22 +2,22 @@
 FROM rust:latest AS builder
 WORKDIR /app
 
-# Cache dependencies by copying Cargo manifests first.
-COPY Cargo.toml ./
+# Copy Cargo manifests to cache dependencies.
+COPY Cargo.toml Cargo.lock* ./
 
-# Create a dummy main file to allow dependency caching.
-RUN mkdir src && echo "fn main() {}" > src/bootstrap.rs
-RUN cargo build --release --bin bootstrap
-RUN rm -rf src
+# Create a dummy main file to cache dependencies.
+RUN mkdir src && \
+    echo "fn main() {}" > src/bootstrap.rs && \
+    cargo build --release --bin bootstrap && \
+    rm -rf src
 
-# Copy the full source code and build the real binary.
+# Copy the full source code and rebuild the actual binary.
 COPY . .
-RUN cargo build --release --bin bootstrap
+RUN cargo clean && cargo build --release --bin bootstrap
 
 # === Runtime Stage ===
 FROM ubuntu:22.04
 RUN apt-get update && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
 # Copy the compiled binary from the builder stage.
