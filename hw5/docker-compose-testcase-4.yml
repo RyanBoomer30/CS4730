@@ -1,0 +1,66 @@
+services:
+  bootstrap:
+    image: prj5-bootstrap
+    networks:
+      - mynetwork
+    hostname: "bootstrap"
+
+  n1:
+    image: prj5-peer
+    networks:
+      - mynetwork
+    hostname: "n1"
+    command: -b bootstrap -d 2 -o objects1.txt
+
+  n5:
+    image: prj5-peer
+    networks:
+      - mynetwork
+    hostname: "n5"
+    command: -b bootstrap -d 4 -o objects5.txt
+
+  n10:
+    image: prj5-peer
+    networks:
+      - mynetwork
+    hostname: "n10"
+    command: -b bootstrap -d 6 -o objects10.txt
+
+  n50:
+    image: prj5-peer
+    networks:
+      - mynetwork
+    hostname: "n50"
+    command: -b bootstrap -d 8 -o objects50.txt
+
+  n66:
+    image: prj5-peer
+    networks:
+      - mynetwork
+    hostname: "n66"
+    command: -b bootstrap -d 10 -o objects66.txt
+
+  n100:
+    image: prj5-peer
+    networks:
+      - mynetwork
+    hostname: "n100"
+    command: -b bootstrap -d 12 -o objects100.txt
+
+  n126:
+    image: prj5-peer
+    networks:
+      - mynetwork
+    hostname: "n126"
+    command: -b bootstrap -d 14 -o objects126.txt
+
+  client:
+    image: prj5-client
+    networks:
+      - mynetwork
+    hostname: "client"
+    command: -b bootstrap -d 16 -t 4
+
+networks:
+  # The presence of these objects is sufficient to define them
+  mynetwork: {}

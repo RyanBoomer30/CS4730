@@ -1,0 +1,37 @@
+# === Build Stage ===
+FROM rust:latest AS builder
+WORKDIR /app
+
+# Cache dependencies by copying Cargo manifests first.
+COPY Cargo.toml ./
+
+# Create a dummy main file to allow dependency caching.
+RUN mkdir src && echo "fn main() {}" > src/peer.rs
+RUN cargo build --release --bin peer
+RUN rm -rf src
+
+# Copy the full source code and build the real binary.
+COPY . .
+RUN cargo build --release --bin peer
+
+# === Runtime Stage ===
+FROM ubuntu:22.04
+RUN apt-get update && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the compiled binary from the builder stage.
+# Rename the binary to "peer" to match your ENTRYPOINT.
+COPY --from=builder /app/target/release/peer /app/peer
+
+# Copy the object files into the image.
+COPY objects1.txt /app/objects1.txt
+COPY objects5.txt /app/objects5.txt
+COPY objects10.txt /app/objects10.txt
+COPY objects50.txt /app/objects50.txt
+COPY objects66.txt /app/objects66.txt
+COPY objects100.txt /app/objects100.txt
+COPY objects126.txt /app/objects126.txt
+
+# Set the entrypoint to the compiled binary.
+ENTRYPOINT ["/app/peer"]

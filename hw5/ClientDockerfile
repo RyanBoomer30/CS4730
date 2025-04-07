@@ -1,0 +1,27 @@
+# === Build Stage ===
+FROM rust:latest AS builder
+WORKDIR /app
+
+# Cache dependencies by copying Cargo manifests first.
+COPY Cargo.toml ./
+
+# Create a dummy main file to allow dependency caching.
+RUN mkdir src && echo "fn main() {}" > src/client.rs
+RUN cargo build --release --bin client
+RUN rm -rf src
+
+# Copy the full source code and build the real binary.
+COPY . .
+RUN cargo build --release --bin client
+
+# === Runtime Stage ===
+FROM ubuntu:22.04
+RUN apt-get update && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the compiled binary from the builder stage.
+COPY --from=builder /app/target/release/client /app/client
+
+# Set the entrypoint to the compiled binary.
+ENTRYPOINT ["/app/client"]
