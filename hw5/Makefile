@@ -18,7 +18,7 @@ clean:
 	docker rmi prj5-peer
 	docker rmi prj5-client
 
-up1: build1 build2 
+up1: 
 	docker compose -f docker-compose-testcase-1.yml up
 
 up2: 
